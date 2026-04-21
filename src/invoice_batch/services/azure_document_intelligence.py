@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
 from invoice_batch.config import AzureConfig
 from invoice_batch.domain.models import DocumentLine, ExtractedDocument
+
+logger = logging.getLogger("invoice_batch.azure")
 
 try:
     from azure.ai.formrecognizer import DocumentAnalysisClient
@@ -27,6 +30,13 @@ _CONTADO_TERMS: frozenset[str] = frozenset({
     "consignacion",
     "consignación",
 })
+
+# Regex para detectar ISBNs de 13 dígitos en el raw_content
+_ISBN_RE = re.compile(r'\b(97[89]\d{10})\b')
+
+# Umbral: si Azure extrajo menos del 50% de los ISBNs presentes en el
+# raw_content, se activa el parser de fallback desde raw_content.
+_ISBN_COVERAGE_THRESHOLD = 0.5
 
 
 def _safe_value(field):
@@ -130,6 +140,148 @@ def _extract_lines(items_field) -> list[DocumentLine]:
 
 
 # ---------------------------------------------------------------------------
+# Detección automática de calidad del resultado de Azure
+# ---------------------------------------------------------------------------
+
+def _isbns_in_raw(raw_content: str) -> set[str]:
+    """Devuelve el conjunto de ISBNs de 13 dígitos presentes en el raw_content."""
+    return set(_ISBN_RE.findall(raw_content))
+
+
+def _isbns_in_lines(lines: list[DocumentLine]) -> set[str]:
+    """Devuelve el conjunto de ISBNs presentes en los ítems extraídos por Azure."""
+    found = set()
+    for line in lines:
+        code = line.values.get("product_code") or ""
+        desc = line.values.get("description") or ""
+        # El ISBN puede estar en product_code directamente
+        if re.fullmatch(r'97[89]\d{10}', code):
+            found.add(code)
+        # O puede haber quedado pegado al inicio de la descripción
+        m = _ISBN_RE.search(desc)
+        if m:
+            found.add(m.group(1))
+    return found
+
+
+def _should_use_raw_parser(raw_content: str, azure_lines: list[DocumentLine]) -> bool:
+    """Decide si conviene reemplazar los ítems de Azure con el parser de raw_content.
+
+    Criterios (basta con que se cumpla uno):
+    - Hay ISBNs en el raw_content pero Azure no extrajo ninguno en los ítems.
+    - Azure capturó menos del 50% de los ISBNs presentes en el raw_content.
+
+    Si el raw_content no tiene ningún ISBN (factura sin libros, por ejemplo),
+    se respeta el resultado de Azure sin tocar nada.
+    """
+    raw_isbns = _isbns_in_raw(raw_content)
+    if not raw_isbns:
+        return False  # No hay ISBNs que comparar, Azure es la única fuente
+
+    azure_isbns = _isbns_in_lines(azure_lines)
+    coverage = len(azure_isbns) / len(raw_isbns)
+
+    if coverage < _ISBN_COVERAGE_THRESHOLD:
+        logger.warning(
+            "Parser híbrido activado: Azure capturó %d/%d ISBNs (%.0f%%). "
+            "Se usará el parser de raw_content para los ítems.",
+            len(azure_isbns), len(raw_isbns), coverage * 100,
+        )
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Parser de ítems directo desde raw_content
+# Cubre los formatos observados en Peyhache y Guadal.
+# ---------------------------------------------------------------------------
+
+def _parse_number(value: str) -> float | None:
+    """Convierte string numérico con punto o coma decimal a float."""
+    try:
+        return float(value.replace(",", "."))
+    except (ValueError, AttributeError):
+        return None
+
+
+# Patrón Peyhache:
+#   {ISBN-13}\n{Descripción}\n{cantidad},00\nUnidad\n{precio},00\n{descuento},00\n{iva%}\n{total},00
+_PEYHACHE_ITEM_RE = re.compile(
+    r'(97[89]\d{10})\n'           # ISBN
+    r'([^\n]+)\n'                  # Descripción
+    r'([\d]+[,.]?\d*)\n'           # Cantidad
+    r'Unidad\n'                    # Unidad de medida (ancla)
+    r'([\d.,]+)\n'                 # Precio unitario
+    r'([\d.,]+)\n'                 # % Descuento
+    r'[\d.,]+\n'                   # IVA% (ignorado, siempre 0)
+    r'([\d.,]+)',                  # Total línea
+)
+
+# Patrón Guadal:
+#   {código corto}\n{ISBN-13} {Descripción}\n{cantidad}\n{precio}\n-{descuento} %\n-{bonif}\n{total}
+_GUADAL_ITEM_RE = re.compile(
+    r'(\d{7})\n'                               # Código corto proveedor
+    r'(97[89]\d{10})\s+([^\n]+)\n'             # ISBN + Descripción en la misma línea
+    r'(\d+)\n'                                 # Cantidad
+    r'([\d.,]+)\n'                             # Precio unitario
+    r'-?([\d.,]+)\s*%\n'                       # % Descuento (con o sin signo negativo)
+    r'-?[\d.,]+\n'                             # Bonificación (ignorada)
+    r'([\d.,]+)',                              # Total línea
+)
+
+
+def _parse_items_from_raw_content(raw_content: str) -> list[DocumentLine]:
+    """Parsea ítems directamente desde el texto crudo del PDF.
+
+    Intenta primero el patrón Peyhache, luego el patrón Guadal.
+    Si ninguno produce resultados, devuelve lista vacía (Azure mantiene el control).
+    """
+    lines: list[DocumentLine] = []
+
+    # Intentar patrón Peyhache
+    matches = _PEYHACHE_ITEM_RE.findall(raw_content)
+    if matches:
+        for index, (isbn, desc, qty, price, discount, total) in enumerate(matches, start=1):
+            lines.append(DocumentLine(
+                line_number=index,
+                values={
+                    "description": desc.strip(),
+                    "quantity": _parse_number(qty),
+                    "unit_price": _parse_number(price),
+                    "line_total": _parse_number(total),
+                    "product_code": isbn,
+                    "item_date": None,
+                    "line_discount": _parse_number(discount),
+                },
+            ))
+        logger.info("Parser raw_content (Peyhache): %d ítems extraídos.", len(lines))
+        return lines
+
+    # Intentar patrón Guadal
+    matches = _GUADAL_ITEM_RE.findall(raw_content)
+    if matches:
+        for index, (code, isbn, desc, qty, price, discount, total) in enumerate(matches, start=1):
+            lines.append(DocumentLine(
+                line_number=index,
+                values={
+                    "description": desc.strip(),
+                    "quantity": _parse_number(qty),
+                    "unit_price": _parse_number(price),
+                    "line_total": _parse_number(total),
+                    "product_code": isbn,
+                    "item_date": None,
+                    "line_discount": _parse_number(discount),
+                },
+            ))
+        logger.info("Parser raw_content (Guadal): %d ítems extraídos.", len(lines))
+        return lines
+
+    logger.warning("Parser raw_content: ningún patrón conocido matchó. Se mantienen ítems de Azure.")
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Parsing complementario sobre texto crudo (result.content)
 # Azure prebuilt-invoice no devuelve estos campos como fields estructurados.
 # ---------------------------------------------------------------------------
@@ -143,7 +295,7 @@ def _parse_cae(content: str) -> str | None:
       - 'CAE Nº:\\n86107042866417'     (PEYHACHE)
     """
     match = re.search(
-        r'C\.?A\.?E\.?\s*(?:N[°º])?\s*:?\s*[\s\n]*(\d{10,})',
+        r'C\.?A\.?E\.?\s*(?:N[\u00b0\u00ba])?\s*:?\s*[\s\n]*(\d{10,})',
         content,
         re.IGNORECASE,
     )
@@ -229,8 +381,14 @@ def _find_discount_for_item(raw_content: str, product_code: str) -> float | None
 
 
 def _enrich_lines_with_discounts(lines: list[DocumentLine], raw_content: str) -> None:
-    """Agrega el descuento a cada línea desde el texto crudo (in-place)."""
+    """Agrega el descuento a cada línea desde el texto crudo (in-place).
+
+    Solo se aplica a líneas que no tienen line_discount ya seteado
+    (el parser de raw_content puede haberlo extraído directamente).
+    """
     for line in lines:
+        if line.values.get("line_discount") is not None:
+            continue  # Ya extraído por el parser híbrido, no pisar
         product_code = line.values.get("product_code")
         line.values["line_discount"] = (
             _find_discount_for_item(raw_content, product_code)
@@ -301,13 +459,13 @@ def _parse_document_subtype(content: str) -> str | None:
         or "diferencias en las devoluciones" in content_lower
         or "diferencias en devoluciones" in content_lower
         or "devolucion de consignacion" in content_lower
-        or "devolución de consignación" in content_lower
+        or "devoluci\u00f3n de consignaci\u00f3n" in content_lower
         or "remito de devolucion" in content_lower
-        or "remito de devolución" in content_lower
+        or "remito de devoluci\u00f3n" in content_lower
     ):
         return "Acuse de Devolución"
     # "factura" solo si no está en frases del tipo "no válido como factura"
-    if re.search(r'(?<!no v[aá]lido como )\bfactura\b', content_lower):
+    if re.search(r'(?<!no v[a\u00e1]lido como )\bfactura\b', content_lower):
         return "Factura"
     return None
 
@@ -333,6 +491,19 @@ def _original_pages_param(pdf_path: Path) -> str | None:
             text = page.extract_text() or ""
             if _COPY_MARKERS.search(text):
                 last_original = i - 1
+                if last_original < 1:
+                    # La marca está en la primera página misma — no truncar
+                    logger.warning(
+                        "Marca de copia detectada en página 1 de '%s'. "
+                        "Se omite el truncado para no perder el original.",
+                        pdf_path.name,
+                    )
+                    return None
+                logger.info(
+                    "Detectada marca de copia en página %d de '%s'. "
+                    "Azure procesará solo páginas 1-%d.",
+                    i, pdf_path.name, last_original,
+                )
                 return str(last_original) if last_original == 1 else f"1-{last_original}"
     except Exception:
         pass
@@ -413,7 +584,14 @@ class AzureDocumentIntelligenceExtractor:
             "raw_total_content": _content(fields.get("InvoiceTotal")),
         }
 
+        # Extraer ítems: Azure primero, parser híbrido si la cobertura es baja
         lines = _extract_lines(fields.get("Items"))
+
+        if _should_use_raw_parser(raw_content, lines):
+            raw_lines = _parse_items_from_raw_content(raw_content)
+            if raw_lines:
+                lines = raw_lines
+
         _enrich_lines_with_discounts(lines, raw_content)
         _enrich_lines_from_devolucion(lines, raw_content)
 
