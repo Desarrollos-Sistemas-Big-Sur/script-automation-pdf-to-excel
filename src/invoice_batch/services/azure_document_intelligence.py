@@ -21,7 +21,6 @@ try:
 except ImportError:  # pragma: no cover
     _PdfReader = None
 
-# Términos de pago que indican pago de contado.
 _CONTADO_TERMS: frozenset[str] = frozenset({
     "contado",
     "contado inmediato",
@@ -34,8 +33,6 @@ _ISBN_RE = re.compile(r'\b(97[89]\d{10})\b')
 
 # Si Azure capturó menos del 50% de ISBNs presentes en raw_content -> activar fallback
 _ISBN_COVERAGE_THRESHOLD = 0.5
-# Si el PDF tiene más ISBNs que el raw_content en más de este factor -> Azure truncó el PDF
-_PDF_TRUNCATION_FACTOR = 1.2
 
 
 def _safe_value(field):
@@ -138,29 +135,31 @@ def _extract_lines(items_field) -> list[DocumentLine]:
 
 
 # ---------------------------------------------------------------------------
-# Detección automática de calidad del resultado de Azure
+# Extracción de texto completo del PDF via pypdf
+# Se usa como fuente principal para los ítems, independiente de Azure.
 # ---------------------------------------------------------------------------
 
-def _isbns_in_raw(raw_content: str) -> set[str]:
-    """ISBNs de 13 dígitos presentes en el raw_content devuelto por Azure."""
-    return set(_ISBN_RE.findall(raw_content))
+def _extract_pdf_text(pdf_path: Path) -> str:
+    """Lee el texto completo del PDF usando pypdf (todas las páginas).
 
-
-def _isbns_in_pdf(pdf_path: Path) -> set[str]:
-    """ISBNs de 13 dígitos presentes en el PDF completo (todas las páginas).
-
-    Usa pypdf para leer el texto directamente del archivo, independientemente
-    de cuántas páginas haya procesado Azure.
-    Devuelve conjunto vacío si pypdf no está disponible o falla.
+    Devuelve string vacío si pypdf no está disponible o falla.
     """
     if _PdfReader is None:
-        return set()
+        logger.warning("pypdf no disponible. No se puede leer texto del PDF: %s", pdf_path.name)
+        return ""
     try:
         reader = _PdfReader(str(pdf_path))
-        full_text = "".join(page.extract_text() or "" for page in reader.pages)
-        return set(_ISBN_RE.findall(full_text))
-    except Exception:
-        return set()
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        logger.debug("pypdf leyó %d páginas de '%s' (%d chars).", len(reader.pages), pdf_path.name, len(text))
+        return text
+    except Exception as exc:
+        logger.warning("pypdf falló leyendo '%s': %s", pdf_path.name, exc)
+        return ""
+
+
+def _isbns_in_text(text: str) -> set[str]:
+    """ISBNs de 13 dígitos presentes en un texto."""
+    return set(_ISBN_RE.findall(text))
 
 
 def _isbns_in_lines(lines: list[DocumentLine]) -> set[str]:
@@ -178,45 +177,46 @@ def _isbns_in_lines(lines: list[DocumentLine]) -> set[str]:
 
 
 def _should_use_raw_parser(
-    raw_content: str,
+    azure_raw_content: str,
+    pdf_full_text: str,
     azure_lines: list[DocumentLine],
-    pdf_path: Path | None = None,
 ) -> bool:
-    """Decide si conviene reemplazar los ítems de Azure con el parser de raw_content.
+    """Decide si usar el parser de texto crudo en lugar de los ítems de Azure.
 
-    Criterio 1 — cobertura baja en raw_content:
-        Azure capturó menos del 50% de los ISBNs presentes en el raw_content.
+    Criterio 1 — cobertura baja en raw_content de Azure:
+        Azure capturó menos del 50% de los ISBNs presentes en su propio raw_content.
 
     Criterio 2 — truncado detectado por pypdf:
-        El PDF físico tiene más ISBNs únicos que el raw_content de Azure
-        en un factor > 1.2, lo que indica que Azure no leyó todo el archivo.
+        El PDF completo tiene más ISBNs únicos que el raw_content de Azure,
+        lo que indica que Azure no leyó todas las páginas.
 
-    Si el raw_content no tiene ningún ISBN, no hay base para comparar
-    y se respeta el resultado de Azure.
+    Si no hay ISBNs en ninguna fuente, se respeta Azure.
     """
-    raw_isbns = _isbns_in_raw(raw_content)
-    if not raw_isbns:
+    raw_isbns = _isbns_in_text(azure_raw_content)
+    pdf_isbns = _isbns_in_text(pdf_full_text)
+
+    # Sin ISBNs en ninguna fuente: no hay base para comparar
+    if not raw_isbns and not pdf_isbns:
         return False
 
-    # Criterio 1: cobertura de ISBNs en raw_content vs lo que extrajo Azure
-    azure_isbns = _isbns_in_lines(azure_lines)
-    coverage = len(azure_isbns) / len(raw_isbns)
-    if coverage < _ISBN_COVERAGE_THRESHOLD:
+    # Criterio 2: pypdf encontró más ISBNs únicos que el raw_content de Azure
+    # Esto indica truncado independientemente de cuántos extrajo Azure en Items
+    if pdf_isbns and len(pdf_isbns) > len(raw_isbns):
         logger.warning(
-            "Parser híbrido activado (cobertura baja): Azure capturó %d/%d ISBNs (%.0f%%).",
-            len(azure_isbns), len(raw_isbns), coverage * 100,
+            "Parser híbrido activado (truncado Azure): PDF completo tiene %d ISBNs únicos, "
+            "raw_content de Azure solo %d. Azure no leyó todo el archivo.",
+            len(pdf_isbns), len(raw_isbns),
         )
         return True
 
-    # Criterio 2: el PDF físico tiene muchos más ISBNs que el raw_content -> Azure truncó
-    if pdf_path is not None:
-        pdf_isbns = _isbns_in_pdf(pdf_path)
-        if pdf_isbns and len(pdf_isbns) > len(raw_isbns) * _PDF_TRUNCATION_FACTOR:
+    # Criterio 1: cobertura baja en lo que Azure sí leyó
+    if raw_isbns:
+        azure_isbns = _isbns_in_lines(azure_lines)
+        coverage = len(azure_isbns) / len(raw_isbns)
+        if coverage < _ISBN_COVERAGE_THRESHOLD:
             logger.warning(
-                "Parser híbrido activado (truncado Azure): PDF tiene %d ISBNs, "
-                "raw_content solo %d (factor %.1fx).",
-                len(pdf_isbns), len(raw_isbns),
-                len(pdf_isbns) / len(raw_isbns),
+                "Parser híbrido activado (cobertura baja): Azure capturó %d/%d ISBNs (%.0f%%).",
+                len(azure_isbns), len(raw_isbns), coverage * 100,
             )
             return True
 
@@ -224,30 +224,25 @@ def _should_use_raw_parser(
 
 
 # ---------------------------------------------------------------------------
-# Parser de ítems directo desde raw_content
+# Parser de ítems directo desde texto crudo
 # ---------------------------------------------------------------------------
 
 def _parse_number(value: str) -> float | None:
     """Convierte string numérico a float.
 
-    Maneja dos formatos:
+    Maneja:
       - Formato argentino/español: 1.234,56  (punto miles, coma decimal)
       - Formato anglosajón:        1,234.56  (coma miles, punto decimal)
     """
     if value is None:
         return None
     v = value.strip()
-    # Si tiene tanto punto como coma, el último separador es el decimal
     if ',' in v and '.' in v:
         if v.rfind('.') > v.rfind(','):
-            # Formato 1,234.56 -> quitar comas
             v = v.replace(',', '')
         else:
-            # Formato 1.234,56 -> quitar puntos, reemplazar coma por punto
             v = v.replace('.', '').replace(',', '.')
     elif ',' in v:
-        # Solo coma: puede ser decimal (45,00) o miles (1,234)
-        # Si hay exactamente 2 dígitos tras la coma, es decimal
         parts = v.split(',')
         if len(parts) == 2 and len(parts[1]) == 2:
             v = v.replace(',', '.')
@@ -285,15 +280,15 @@ _GUADAL_ITEM_RE = re.compile(
 )
 
 
-def _parse_items_from_raw_content(raw_content: str) -> list[DocumentLine]:
-    """Parsea ítems directamente desde el texto crudo del PDF.
+def _parse_items_from_text(text: str) -> list[DocumentLine]:
+    """Parsea ítems directamente desde texto crudo (raw_content de Azure o texto pypdf).
 
     Intenta primero patrón Peyhache, luego Guadal.
-    Si ninguno produce resultados, devuelve lista vacía.
+    Devuelve lista vacía si ningún patrón matchea.
     """
     lines: list[DocumentLine] = []
 
-    matches = _PEYHACHE_ITEM_RE.findall(raw_content)
+    matches = _PEYHACHE_ITEM_RE.findall(text)
     if matches:
         for index, (isbn, desc, qty, price, discount, total) in enumerate(matches, start=1):
             lines.append(DocumentLine(
@@ -308,10 +303,10 @@ def _parse_items_from_raw_content(raw_content: str) -> list[DocumentLine]:
                     "line_discount": _parse_number(discount),
                 },
             ))
-        logger.info("Parser raw_content (Peyhache): %d ítems extraídos.", len(lines))
+        logger.info("Parser texto (Peyhache): %d ítems extraídos.", len(lines))
         return lines
 
-    matches = _GUADAL_ITEM_RE.findall(raw_content)
+    matches = _GUADAL_ITEM_RE.findall(text)
     if matches:
         for index, (code, isbn, desc, qty, price, discount, total) in enumerate(matches, start=1):
             lines.append(DocumentLine(
@@ -326,10 +321,10 @@ def _parse_items_from_raw_content(raw_content: str) -> list[DocumentLine]:
                     "line_discount": _parse_number(discount),
                 },
             ))
-        logger.info("Parser raw_content (Guadal): %d ítems extraídos.", len(lines))
+        logger.info("Parser texto (Guadal): %d ítems extraídos.", len(lines))
         return lines
 
-    logger.warning("Parser raw_content: ningún patrón conocido matchó. Se mantienen ítems de Azure.")
+    logger.warning("Parser texto: ningún patrón conocido matchó. Se mantienen ítems de Azure.")
     return []
 
 
@@ -522,6 +517,11 @@ class AzureDocumentIntelligenceExtractor:
     def extract(self, file_path: Path, document_type: str) -> tuple[ExtractedDocument, dict]:
         client = self._get_client()
 
+        # Leer el PDF completo con pypdf ANTES de llamar a Azure.
+        # Esto nos da el texto de todas las páginas independientemente de
+        # cuántas procese Azure, y sirve como fuente de fallback para los ítems.
+        pdf_full_text = _extract_pdf_text(file_path)
+
         pages = _original_pages_param(file_path) or self.config.pages
         kwargs = {}
         if pages:
@@ -569,14 +569,22 @@ class AzureDocumentIntelligenceExtractor:
             "raw_total_content": _content(fields.get("InvoiceTotal")),
         }
 
-        # Extraer ítems: Azure primero, parser híbrido si la cobertura es baja
-        # o si Azure trunco el PDF (detectado comparando ISBNs del archivo vs raw_content)
+        # Estrategia de extracción de ítems:
+        # 1. Azure extrae los ítems que pudo leer
+        # 2. Se compara el texto completo del PDF (pypdf) con el raw_content de Azure
+        # 3. Si pypdf encontró más ISBNs únicos que Azure, significa que Azure truncó
+        #    el PDF -> se parsea el texto completo del PDF con los patrones propios
+        # 4. Si la cobertura de Azure sobre su propio raw_content es baja -> fallback
         lines = _extract_lines(fields.get("Items"))
 
-        if _should_use_raw_parser(raw_content, lines, pdf_path=file_path):
-            raw_lines = _parse_items_from_raw_content(raw_content)
-            if raw_lines:
-                lines = raw_lines
+        if _should_use_raw_parser(raw_content, pdf_full_text, lines):
+            # Intentar primero con el texto completo del PDF (más confiable)
+            parsed_lines = _parse_items_from_text(pdf_full_text) if pdf_full_text else []
+            # Si el texto del PDF no dio resultados, intentar con el raw_content de Azure
+            if not parsed_lines:
+                parsed_lines = _parse_items_from_text(raw_content)
+            if parsed_lines:
+                lines = parsed_lines
 
         _enrich_lines_with_discounts(lines, raw_content)
         _enrich_lines_from_devolucion(lines, raw_content)
