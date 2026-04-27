@@ -33,10 +33,7 @@ class BatchRunner:
         run_id = started_at.strftime("%Y%m%d_%H%M%S")
         self.file_manager.ensure_directories()
 
-        # ------------------------------------------------------------------
-        # OneDrive: sincronizar pendientes si está habilitado
-        # ------------------------------------------------------------------
-        od_item_map: dict[str, str] = {}  # nombre de archivo → item_id OneDrive
+        od_item_map: dict[str, str] = {}
 
         if self.onedrive_client is not None:
             self.logger.info("OneDrive habilitado — verificando carpetas...")
@@ -72,12 +69,20 @@ class BatchRunner:
                 results.append(result)
                 self.reporter.report_file_result(result)
 
-                # Archivar PDF en OneDrive si fue descargado desde allí
                 if self.onedrive_client is not None and file_path.name in od_item_map:
                     item_id = od_item_map[file_path.name]
                     success = result.status in ("success", "warning")
+                    needs_review = any(
+                        msg.code == "total_amount_mismatch"
+                        for msg in result.validation_messages
+                    )
                     try:
-                        self.onedrive_client.archive_pdf(item_id, file_path.name, success)
+                        self.onedrive_client.archive_pdf(
+                            item_id,
+                            file_path.name,
+                            success,
+                            needs_review=needs_review,
+                        )
                     except Exception as exc:
                         self.logger.error(
                             "No se pudo archivar %s en OneDrive: %s", file_path.name, exc

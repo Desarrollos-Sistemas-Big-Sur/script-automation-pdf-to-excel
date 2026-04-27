@@ -51,17 +51,18 @@ class AzureConfig:
     endpoint: str
     key: str
     model_id: str = "prebuilt-invoice"
-    pages: str | None = None  # ej: "1", "1-2". None = todas las páginas.
+    pages: str | None = None
 
 
 @dataclass(slots=True)
 class OneDriveConfig:
     enabled: bool = False
-    user_email: str = ""        # email del usuario dueño del OneDrive destino
-    folder_path: str = ""       # ruta raíz dentro del OneDrive, ej: "Documentos/Proyecto - PDFs a Excel"
-    pending_folder: str = "Pendientes"    # subcarpeta donde caen los PDFs a procesar
-    processed_folder: str = "Procesados"  # subcarpeta destino de PDFs procesados ok
-    error_folder: str = "Errores"         # subcarpeta destino de PDFs que fallaron
+    user_email: str = ""
+    folder_path: str = ""
+    pending_folder: str = "Pendientes"
+    processed_folder: str = "Procesados"
+    error_folder: str = "Errores"
+    review_folder: str = "Revisar"   # facturas con discrepancia de totales
 
 
 @dataclass(slots=True)
@@ -130,6 +131,7 @@ def load_config(config_path: Path) -> AppConfig:
         pending_folder=onedrive_raw.get("pending_folder", "Pendientes"),
         processed_folder=onedrive_raw.get("processed_folder", "Procesados"),
         error_folder=onedrive_raw.get("error_folder", "Errores"),
+        review_folder=onedrive_raw.get("review_folder", "Revisar"),
     )
 
     return AppConfig(

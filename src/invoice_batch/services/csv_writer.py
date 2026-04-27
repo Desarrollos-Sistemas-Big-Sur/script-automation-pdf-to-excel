@@ -15,14 +15,12 @@ except ImportError:  # pragma: no cover
 
 
 def _numeric(value, fallback="-"):
-    """Devuelve el valor numérico real para la celda, o fallback si es None."""
     if value is None:
         return fallback
     return value
 
 
 def _discount_value(value):
-    """Devuelve el descuento como entero si es redondo (45), float si no (45.5), o '-'."""
     if value is None:
         return "-"
     return int(value) if value == int(value) else value
@@ -35,12 +33,10 @@ def _format_date(value) -> str:
 
 
 def _is_isbn(code: str | None) -> bool:
-    """Detecta si un código de producto es un ISBN-13 (13 dígitos numéricos)."""
     return bool(code and code.isdigit() and len(code) == 13)
 
 
 def _apply_header_style(ws) -> None:
-    """Estilo visual para la sección de cabecera (fondo azul oscuro, texto blanco)."""
     fill = PatternFill("solid", fgColor="1F4E78")
     font = Font(color="FFFFFF", bold=True)
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
@@ -51,7 +47,6 @@ def _apply_header_style(ws) -> None:
 
 
 def _apply_detail_header_style(ws, row_number: int) -> None:
-    """Estilo para la fila de encabezado del detalle de ítems."""
     fill = PatternFill("solid", fgColor="2E75B6")
     font = Font(color="FFFFFF", bold=True)
     for cell in ws[row_number]:
@@ -70,10 +65,18 @@ def _autofit(ws) -> None:
         ws.column_dimensions[col_letter].width = min(max_len + 3, 50)
 
 
+def _has_total_mismatch(result: FileProcessResult) -> bool:
+    """Devuelve True si el resultado tiene warning de discrepancia de totales."""
+    return any(
+        msg.code == "total_amount_mismatch"
+        for msg in result.validation_messages
+    )
+
+
 class ExcelOutputWriter:
     def __init__(self, config: AppConfig, uploader=None) -> None:
         self.config = config
-        self.uploader = uploader  # OneDriveUploader opcional
+        self.uploader = uploader
 
     def write_document_artifacts(self, run_context: RunContext, result: FileProcessResult) -> None:
         if self.config.processing.write_raw_json:
@@ -135,7 +138,6 @@ class ExcelOutputWriter:
             fields.get("document_letter"),
         ])) or "-"
 
-        # Filas de cabecera — referencia visual para carga manual en Fierro
         header_rows = [
             ("Proveedor",            fields.get("vendor_name") or "-"),
             ("Tipo",                 doc_type),
@@ -155,13 +157,11 @@ class ExcelOutputWriter:
         for label, value in header_rows:
             ws.append([label, value])
 
-        ws.append([])  # fila en blanco separadora
+        ws.append([])
 
-        # Encabezado del detalle de ítems
         detail_header_row = ws.max_row + 1
         ws.append(["Cód. proveedor", "ISBN", "Título", "Cantidad", "Precio unitario", "Descuento %"])
 
-        # Ítems
         for line in document.lines:
             v = line.values
             product_code = v.get("product_code") or "-"
@@ -188,8 +188,9 @@ class ExcelOutputWriter:
 
         if self.uploader is not None and self.config.onedrive.enabled:
             try:
+                needs_review = _has_total_mismatch(result)
                 document_subtype = fields.get("document_subtype")
-                self.uploader.upload_excel(excel_path, document_subtype)
+                self.uploader.upload_excel(excel_path, document_subtype, needs_review=needs_review)
             except Exception as exc:
                 import logging
                 logging.getLogger("invoice_batch.excel_writer").warning(
