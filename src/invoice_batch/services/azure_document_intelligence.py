@@ -31,6 +31,7 @@ _CONTADO_TERMS: frozenset[str] = frozenset({
 })
 
 _ISBN_RE = re.compile(r'\b(97[89]\d{10})\b')
+_ISBN_FULLMATCH = re.compile(r'^97[89]\d{10}$')
 
 # Si Azure capturó menos del 50% de los ISBNs presentes en el raw_content
 # -> activar el parser híbrido sobre el raw_content.
@@ -151,7 +152,7 @@ def _isbns_in_lines(lines: list[DocumentLine]) -> set[str]:
     for line in lines:
         code = line.values.get("product_code") or ""
         desc = line.values.get("description") or ""
-        if re.fullmatch(r'97[89]\d{10}', code):
+        if _ISBN_FULLMATCH.match(code):
             found.add(code)
         m = _ISBN_RE.search(desc)
         if m:
@@ -163,12 +164,7 @@ def _should_use_raw_parser(raw_content: str, azure_lines: list[DocumentLine]) ->
     """Decide si usar el parser híbrido sobre el raw_content de Azure.
 
     Se activa cuando Azure capturó menos del 50% de los ISBNs presentes
-    en su propio raw_content. Esto cubre dos casos:
-      - Azure extrajo el texto completo pero no parseo bien los Items (Guadal)
-      - Azure extrajo el texto completo con S0 pero Items tiene límite interno
-
-    Si el raw_content no tiene ISBNs, no hay base para comparar y se
-    respeta el resultado de Azure sin cambios.
+    en su propio raw_content.
     """
     raw_isbns = _isbns_in_text(raw_content)
     if not raw_isbns:
@@ -197,10 +193,11 @@ def _parse_number(value: str) -> float | None:
     Maneja:
       - Formato argentino/español: 1.234,56  (punto miles, coma decimal)
       - Formato anglosajón:        1,234.56  (coma miles, punto decimal)
+      - Con signo pesos:            $ 1.234,56
     """
     if value is None:
         return None
-    v = value.strip()
+    v = value.strip().lstrip('$').strip()
     if ',' in v and '.' in v:
         if v.rfind('.') > v.rfind(','):
             v = v.replace(',', '')
@@ -243,11 +240,22 @@ _GUADAL_ITEM_RE = re.compile(
     r'([\d.,]+)',
 )
 
+# Patrón Eterna/Waldhuter — formato Azure raw_content:
+#   {cantidad}\n{ISBN-13}\n{descripción}\n$ {precio}\n{descuento}\n$ {total}
+_ETERNA_ITEM_RE = re.compile(
+    r'(\d+)\n'
+    r'(97[89]\d{10}|\d{9,12})\n'   # ISBN-13 o código numérico más corto
+    r'([^\n]+)\n'
+    r'\$\s*([\d.,]+)\n'             # precio con $ adelante
+    r'([\d.]+)\n'                   # descuento (ej: 47.00)
+    r'\$\s*([\d.,]+)',              # total con $ adelante
+)
+
 
 def _parse_items_from_raw_content(raw_content: str) -> list[DocumentLine]:
     """Parsea ítems directamente desde el raw_content de Azure.
 
-    Intenta primero patrón Peyhache, luego Guadal.
+    Intenta en orden: Peyhache, Guadal, Eterna/Waldhuter.
     Devuelve lista vacía si ningún patrón matchea.
     """
     # Peyhache
@@ -294,12 +302,34 @@ def _parse_items_from_raw_content(raw_content: str) -> list[DocumentLine]:
         logger.info("Parser raw_content (Guadal): %d ítems extraídos.", len(lines))
         return lines
 
+    # Eterna/Waldhuter
+    matches = _ETERNA_ITEM_RE.findall(raw_content)
+    if matches:
+        lines = [
+            DocumentLine(
+                line_number=i,
+                values={
+                    "description": desc.strip(),
+                    "quantity": _parse_number(qty),
+                    "unit_price": _parse_number(price),
+                    "line_total": _parse_number(total),
+                    "product_code": code,
+                    "item_date": None,
+                    "line_discount": _parse_number(discount),
+                },
+            )
+            for i, (qty, code, desc, price, discount, total)
+            in enumerate(matches, start=1)
+        ]
+        logger.info("Parser raw_content (Eterna/Waldhuter): %d ítems extraídos.", len(lines))
+        return lines
+
     logger.warning("Parser raw_content: ningún patrón matcheo. Se mantienen ítems de Azure.")
     return []
 
 
 # ---------------------------------------------------------------------------
-# Parsing complementario sobre texto crudo
+# Enriquecimiento de líneas desde raw_content
 # ---------------------------------------------------------------------------
 
 def _parse_cae(content: str) -> str | None:
@@ -313,7 +343,7 @@ def _parse_cae(content: str) -> str | None:
 
 def _parse_cae_due_date(content: str) -> str | None:
     match = re.search(
-        r'Fecha\s+(?:de\s+)?Vto\.?\s*(?:\s*de\s+CAE)?\s*\.?:?\s*[\s\n]*(\d{2}/\d{2}/\d{4})',
+        r'Fecha\s+(?:de\s+)?Vto\.?\s*(?:\s*de\s+CAE)?\s*\.?:?\s*[\s\n]*(\d{2}[/-]\d{2}[/-]\d{4})',
         content,
         re.IGNORECASE,
     )
@@ -333,8 +363,17 @@ def _parse_pct(value: str) -> float | None:
 
 
 def _find_discount_for_item(raw_content: str, product_code: str) -> float | None:
+    """Busca el descuento de un ítem en el raw_content usando el product_code como ancla.
+
+    Cubre los formatos observados:
+      - Peyhache:        {code}\n{desc}\n{qty}\nUnidad\n{precio}\n{desc%}\n
+      - Eterna/Waldhuter: {qty}\n{code}\n{desc}\n$ {precio}\n{desc%}\n$ {total}
+      - Ediciones Continente: {code}\n{qty}\n{desc}\n{precio}\n{desc%}\n
+      - Trapezoide:      {code}\n{desc}\n{qty} unidades\n{precio} {desc%}\n
+    """
     escaped = re.escape(product_code)
 
+    # Peyhache: unidad en línea propia
     m = re.search(
         escaped + r"\n[^\n]+\n[^\n]+\nUnidad\n[^\n]+\n([\d,]+)\n",
         raw_content,
@@ -342,6 +381,15 @@ def _find_discount_for_item(raw_content: str, product_code: str) -> float | None
     if m:
         return _parse_pct(m.group(1))
 
+    # Eterna/Waldhuter: {qty}\n{code}\n{desc}\n$ {precio}\n{desc%}\n$ {total}
+    m = re.search(
+        r'\d+\n' + escaped + r'\n[^\n]+\n\$\s*[\d.,]+\n([\d.]+)\n',
+        raw_content,
+    )
+    if m:
+        return _parse_pct(m.group(1))
+
+    # Ediciones Continente: qty en segunda línea
     m = re.search(
         escaped + r"\n\d+\n[^\n]+\n[^\n]+\n(\d+)\n",
         raw_content,
@@ -349,6 +397,7 @@ def _find_discount_for_item(raw_content: str, product_code: str) -> float | None
     if m:
         return _parse_pct(m.group(1))
 
+    # Trapezoide: precio y descuento en la misma línea
     m = re.search(
         escaped + r"\n[^\n]+\n[^\n]+ unidades\n[^\n]+ ([\d,]+)\n",
         raw_content,
@@ -359,19 +408,46 @@ def _find_discount_for_item(raw_content: str, product_code: str) -> float | None
     return None
 
 
+def _find_isbn_for_line(raw_content: str, description: str) -> str | None:
+    """Busca el ISBN en el raw_content para una línea cuyo product_code no es un ISBN.
+
+    Útil para proveedores como Eterna/Waldhuter donde Azure puede no extraer
+    el ISBN en ProductCode. Busca el ISBN inmediatamente antes de la descripción.
+    """
+    if not description:
+        return None
+    # Buscar el ISBN que aparece en la línea anterior a la descripción
+    escaped_desc = re.escape(description[:30])  # primeros 30 chars como ancla
+    m = re.search(
+        r'(97[89]\d{10}|\d{9,12})\n[^\n]*' + escaped_desc,
+        raw_content,
+    )
+    if m:
+        return m.group(1)
+    return None
+
+
 def _enrich_lines_with_discounts(lines: list[DocumentLine], raw_content: str) -> None:
-    """Agrega descuento a cada línea desde raw_content (in-place).
-    No pisa line_discount ya seteado por el parser híbrido.
+    """Agrega descuento e ISBN a cada línea desde raw_content (in-place).
+
+    - No pisa line_discount ya seteado por el parser híbrido.
+    - Si product_code no es un ISBN de 13 dígitos, intenta rescatar el ISBN
+      desde el raw_content usando la descripción como ancla.
     """
     for line in lines:
-        if line.values.get("line_discount") is not None:
-            continue
         product_code = line.values.get("product_code")
-        line.values["line_discount"] = (
-            _find_discount_for_item(raw_content, product_code)
-            if product_code
-            else None
-        )
+        description = line.values.get("description") or ""
+
+        # Rescatar ISBN si product_code no es ISBN válido
+        if not product_code or not _ISBN_FULLMATCH.match(str(product_code)):
+            isbn = _find_isbn_for_line(raw_content, description)
+            if isbn:
+                line.values["product_code"] = isbn
+                product_code = isbn
+
+        # Agregar descuento si no está ya seteado
+        if line.values.get("line_discount") is None and product_code:
+            line.values["line_discount"] = _find_discount_for_item(raw_content, product_code)
 
 
 # ---------------------------------------------------------------------------
@@ -534,9 +610,7 @@ class AzureDocumentIntelligenceExtractor:
             "raw_total_content": _content(fields.get("InvoiceTotal")),
         }
 
-        # Extraer ítems: Azure primero, parser híbrido si la cobertura de ISBNs es baja.
-        # Con S0 Azure lee el PDF completo, por lo que el raw_content tiene todos los
-        # ítems. El parser híbrido se activa cuando Azure no los extrajo bien en Items.
+        # Extraer ítems: Azure primero, parser híbrido si cobertura de ISBNs es baja.
         lines = _extract_lines(fields.get("Items"))
 
         if _should_use_raw_parser(raw_content, lines):
@@ -544,6 +618,9 @@ class AzureDocumentIntelligenceExtractor:
             if parsed_lines:
                 lines = parsed_lines
 
+        # Siempre enriquecer: rescata ISBN y descuento desde raw_content
+        # para todos los proveedores, incluyendo Eterna/Waldhuter donde
+        # Azure extrae bien los totales pero no el ISBN ni el descuento.
         _enrich_lines_with_discounts(lines, raw_content)
         _enrich_lines_from_devolucion(lines, raw_content)
 
