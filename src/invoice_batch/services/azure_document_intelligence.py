@@ -33,9 +33,19 @@ _CONTADO_TERMS: frozenset[str] = frozenset({
 _ISBN_RE = re.compile(r'\b(97[89]\d{10})\b')
 _ISBN_FULLMATCH = re.compile(r'^97[89]\d{10}$')
 
-# Si Azure capturó menos del 50% de los ISBNs presentes en el raw_content
-# -> activar el parser híbrido sobre el raw_content.
-_ISBN_COVERAGE_THRESHOLD = 0.5
+# Umbral de cobertura de ISBNs: si Azure capturó menos del 90% de los ISBNs
+# presentes en el raw_content, se activa el parser híbrido completo.
+# 90% es estricto — significa que Azure puede fallar en hasta 1 de cada 10
+# ISBNs antes de que descartemos sus Items por completo.
+_ISBN_COVERAGE_THRESHOLD = 0.9
+
+# Ancla mínima para el enrichment por título: si el título tiene menos de
+# 8 caracteres, no intentamos buscarlo en el raw_content (riesgo de falsos
+# positivos demasiado alto).
+_MIN_TITLE_ANCHOR_LEN = 8
+
+# Cuántos caracteres del título usar como ancla de búsqueda.
+_TITLE_ANCHOR_LEN = 20
 
 
 def _safe_value(field):
@@ -117,7 +127,7 @@ def _extract_lines(items_field) -> list[DocumentLine]:
     """Extrae los ítems del campo Items de Azure prebuilt-invoice.
 
     Mapea todos los campos estructurados disponibles incluyendo Discount,
-    que Azure extrae nativamente pero que no se estaba usando.
+    que Azure extrae nativamente.
     """
     items: list[DocumentLine] = []
     if not items_field or not items_field.value:
@@ -135,10 +145,6 @@ def _extract_lines(items_field) -> list[DocumentLine]:
                     "line_total": _amount(data.get("Amount")),
                     "product_code": _safe_text(data.get("ProductCode")),
                     "item_date": _safe_text(data.get("Date")),
-                    # Discount: campo nativo de Azure prebuilt-invoice.
-                    # Puede ser un porcentaje (47.0) o un monto absoluto.
-                    # Se usa como fuente primaria; el fallback desde raw_content
-                    # se aplica solo si Azure no lo devuelve.
                     "line_discount": _amount(data.get("Discount")) or _safe_value(data.get("Discount")),
                 },
             )
@@ -171,11 +177,11 @@ def _isbns_in_lines(lines: list[DocumentLine]) -> set[str]:
 
 
 def _should_use_raw_parser(raw_content: str, azure_lines: list[DocumentLine]) -> bool:
-    """Decide si usar el parser híbrido sobre el raw_content de Azure.
+    """Decide si usar el parser híbrido completo sobre el raw_content.
 
-    Se activa cuando Azure capturó menos del 50% de los ISBNs presentes
-    en su propio raw_content. Esto indica que los ítems no fueron bien
-    extraídos en el campo Items (Guadal, Peyhache con F0, etc.).
+    Se activa cuando Azure capturó menos del 90% de los ISBNs presentes
+    en su propio raw_content. Umbral alto porque preferimos el enrichment
+    línea por línea (más quirúrgico) sobre reemplazar todos los ítems.
     """
     raw_isbns = _isbns_in_text(raw_content)
     if not raw_isbns:
@@ -184,10 +190,16 @@ def _should_use_raw_parser(raw_content: str, azure_lines: list[DocumentLine]) ->
     azure_isbns = _isbns_in_lines(azure_lines)
     coverage = len(azure_isbns) / len(raw_isbns)
 
+    logger.info(
+        "Cobertura ISBNs Azure: %d/%d (%.0f%%). Umbral: %.0f%%.",
+        len(azure_isbns), len(raw_isbns), coverage * 100,
+        _ISBN_COVERAGE_THRESHOLD * 100,
+    )
+
     if coverage < _ISBN_COVERAGE_THRESHOLD:
         logger.warning(
-            "Parser híbrido activado: Azure capturó %d/%d ISBNs (%.0f%%) del raw_content.",
-            len(azure_isbns), len(raw_isbns), coverage * 100,
+            "Parser híbrido activado: Azure capturó solo %.0f%% de los ISBNs.",
+            coverage * 100,
         )
         return True
 
@@ -195,8 +207,8 @@ def _should_use_raw_parser(raw_content: str, azure_lines: list[DocumentLine]) ->
 
 
 # ---------------------------------------------------------------------------
-# Parser de ítems directo desde raw_content (fallback)
-# Se usa cuando Azure no extrajo bien los Items.
+# Parser de ítems directo desde raw_content (fallback completo)
+# Se usa cuando Azure no extrajo bien los Items en general.
 # ---------------------------------------------------------------------------
 
 def _parse_number(value: str) -> float | None:
@@ -309,7 +321,137 @@ def _parse_items_from_raw_content(raw_content: str) -> list[DocumentLine]:
 
 
 # ---------------------------------------------------------------------------
-# Enriquecimiento desde raw_content (colchón para campos que Azure no extrajo)
+# Enrichment genérico línea por línea
+# ---------------------------------------------------------------------------
+
+# Número de 9 a 13 dígitos: cubre ISBN-13, ISBN-10 y códigos de proveedor
+# numéricos. En facturas de libros argentinas la primera o segunda columna
+# siempre es el código o ISBN.
+_CODE_RE = re.compile(r'\b(\d{9,13})\b')
+
+# Descuento: número de 1-3 dígitos, opcionalmente con decimales o signo %.
+# Cubre: 47.00 | 50 | -50 % | 47,00
+_DISCOUNT_RE = re.compile(r'-?(\d{1,3}(?:[.,]\d{1,2})?)\s*%?')
+
+
+def _enrich_line_from_raw_content(
+    raw_content: str,
+    description: str,
+) -> tuple[str | None, float | None]:
+    """Busca código/ISBN y descuento en el raw_content usando el título como ancla.
+
+    Estrategia genérica — no asume nada del proveedor:
+      1. Tomar los primeros _TITLE_ANCHOR_LEN chars del título como ancla.
+      2. Buscar esa cadena en el raw_content.
+      3. Mirar hacia atrás desde el título: el número más largo de 9-13
+         dígitos inmediatamente antes es el código/ISBN.
+      4. Mirar hacia adelante desde el título: el primer número que parezca
+         un porcentaje de descuento (1-3 dígitos, opcionalmente decimales).
+
+    Devuelve (codigo, descuento). Cualquiera puede ser None si no se encontró.
+    """
+    if not description or len(description) < _MIN_TITLE_ANCHOR_LEN:
+        return None, None
+
+    anchor = re.escape(description[:_TITLE_ANCHOR_LEN])
+    m = re.search(anchor, raw_content)
+    if not m:
+        return None, None
+
+    pos = m.start()
+
+    # --- Código/ISBN: buscar hacia atrás en las 2 líneas previas ---
+    # Tomamos el texto desde 200 chars antes hasta el inicio del título
+    before = raw_content[max(0, pos - 200):pos]
+    # Quedarnos solo con las últimas 2 líneas antes del título
+    before_lines = before.rstrip('\n').split('\n')
+    before_window = '\n'.join(before_lines[-2:]) if before_lines else ''
+
+    code_found = None
+    # Buscar el número más largo de 9-13 dígitos en esas líneas
+    code_matches = _CODE_RE.findall(before_window)
+    if code_matches:
+        # Preferir el más largo (más probable que sea ISBN o código de proveedor)
+        code_found = max(code_matches, key=len)
+
+    # --- Descuento: buscar hacia adelante en las 4 líneas siguientes ---
+    after = raw_content[pos + len(m.group()):pos + len(m.group()) + 300]
+    after_lines = after.lstrip('\n').split('\n')
+    after_window = '\n'.join(after_lines[:4]) if after_lines else ''
+
+    discount_found = None
+    for line in after_lines[:4]:
+        line = line.strip()
+        # Buscar líneas que sean solo un número de descuento (ej: "47.00" o "-50 %")
+        dm = re.fullmatch(r'-?(\d{1,3}(?:[.,]\d{1,2})?)\s*%?', line)
+        if dm:
+            try:
+                val = float(dm.group(1).replace(',', '.'))
+                # Rango razonable de descuento: 1% a 99%
+                if 1 <= val <= 99:
+                    discount_found = val
+                    break
+            except ValueError:
+                continue
+
+    return code_found, discount_found
+
+
+def _find_isbn_in_description(description: str) -> str | None:
+    """Extrae el ISBN de la descripción si Azure lo puso ahí en lugar de en ProductCode."""
+    if not description:
+        return None
+    m = _ISBN_RE.search(description)
+    return m.group(1) if m else None
+
+
+def _enrich_lines_with_discounts(lines: list[DocumentLine], raw_content: str) -> None:
+    """Colchón genérico: completa código/ISBN y descuento faltantes (in-place).
+
+    Para cada línea donde product_code o line_discount son None:
+      1. Intentar extraer el ISBN de la descripción (Azure a veces los mezcla).
+      2. Si sigue faltando código o descuento, usar el título como ancla
+         en el raw_content y extraer los valores del bloque circundante.
+         Esta lógica es genérica — no asume nada del proveedor.
+    """
+    enriched_code = 0
+    enriched_discount = 0
+
+    for line in lines:
+        product_code = line.values.get("product_code") or ""
+        description = line.values.get("description") or ""
+        needs_code = not product_code or not re.match(r'^\d{9,13}$', str(product_code))
+        needs_discount = line.values.get("line_discount") is None
+
+        # Paso 1: ISBN oculto en la descripción
+        if needs_code:
+            isbn_from_desc = _find_isbn_in_description(description)
+            if isbn_from_desc:
+                line.values["product_code"] = isbn_from_desc
+                product_code = isbn_from_desc
+                needs_code = False
+
+        # Paso 2: enrichment genérico por título como ancla
+        if needs_code or needs_discount:
+            raw_code, raw_discount = _enrich_line_from_raw_content(raw_content, description)
+
+            if needs_code and raw_code:
+                line.values["product_code"] = raw_code
+                enriched_code += 1
+
+            if needs_discount and raw_discount is not None:
+                line.values["line_discount"] = raw_discount
+                enriched_discount += 1
+
+    if enriched_code or enriched_discount:
+        logger.info(
+            "Enrichment genérico: %d códigos y %d descuentos rescatados desde raw_content.",
+            enriched_code, enriched_discount,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Parsing complementario sobre texto crudo
 # ---------------------------------------------------------------------------
 
 def _parse_cae(content: str) -> str | None:
@@ -335,78 +477,26 @@ def _parse_document_letter(content: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _parse_pct(value: str) -> float | None:
-    try:
-        return float(value.replace(",", "."))
-    except (ValueError, AttributeError):
-        return None
-
-
-def _find_discount_for_item(raw_content: str, product_code: str) -> float | None:
-    """Colchón: busca el descuento en raw_content cuando Azure no lo extrajo.
-
-    Solo se llama si line_discount es None después de _extract_lines.
-    Cubre los formatos observados en Peyhache y Guadal.
-    """
-    escaped = re.escape(product_code)
-
-    # Peyhache: unidad en línea propia
-    m = re.search(
-        escaped + r"\n[^\n]+\n[^\n]+\nUnidad\n[^\n]+\n([\d,]+)\n",
-        raw_content,
-    )
-    if m:
-        return _parse_pct(m.group(1))
-
-    # Guadal: -XX % en línea separada
-    m = re.search(
-        escaped + r"\s+[^\n]+\n\d+\n[^\n]+\n-?([\d.,]+)\s*%\n",
-        raw_content,
-    )
-    if m:
-        return _parse_pct(m.group(1))
-
-    # Genérico: busca un número de 2 dígitos seguido de .00 cerca del product_code
-    # Cubre formatos como "47.00" (Eterna/Waldhuter)
-    m = re.search(
-        r'(?:^|\n)\d+\n' + escaped + r'\n[^\n]+\n[^\n]+\n(\d{1,3}\.\d{2})\n',
-        raw_content,
-    )
-    if m:
-        return _parse_pct(m.group(1))
-
+def _parse_document_subtype(content: str) -> str | None:
+    content_lower = content.lower()
+    if "nota de cr\u00e9dito" in content_lower or "nota de credito" in content_lower:
+        return "Nota de Crédito"
+    if "nota de d\u00e9bito" in content_lower or "nota de debito" in content_lower:
+        return "Nota de Débito"
+    if (
+        "nota de devoluci\u00f3n" in content_lower
+        or "nota de devolucion" in content_lower
+        or "diferencias en las devoluciones" in content_lower
+        or "diferencias en devoluciones" in content_lower
+        or "devolucion de consignacion" in content_lower
+        or "devoluci\u00f3n de consignaci\u00f3n" in content_lower
+        or "remito de devolucion" in content_lower
+        or "remito de devoluci\u00f3n" in content_lower
+    ):
+        return "Acuse de Devolución"
+    if re.search(r'(?<!no v[a\u00e1]lido como )\bfactura\b', content_lower):
+        return "Factura"
     return None
-
-
-def _find_isbn_in_description(description: str) -> str | None:
-    """Extrae el ISBN de la descripción si Azure lo puso ahí en lugar de en ProductCode."""
-    if not description:
-        return None
-    m = _ISBN_RE.search(description)
-    return m.group(1) if m else None
-
-
-def _enrich_lines_with_discounts(lines: list[DocumentLine], raw_content: str) -> None:
-    """Colchón: completa ISBN y descuento desde raw_content (in-place).
-
-    - Si product_code no es un ISBN válido, intenta encontrar el ISBN
-      en la descripción (Azure a veces los pone juntos).
-    - Si line_discount es None (Azure no lo extrajo), lo busca en raw_content.
-    """
-    for line in lines:
-        product_code = line.values.get("product_code") or ""
-        description = line.values.get("description") or ""
-
-        # Si product_code no es ISBN válido, buscar en la descripción
-        if not _ISBN_FULLMATCH.match(str(product_code)):
-            isbn_from_desc = _find_isbn_in_description(description)
-            if isbn_from_desc:
-                line.values["product_code"] = isbn_from_desc
-                product_code = isbn_from_desc
-
-        # Si Azure no trajo descuento, buscar en raw_content como fallback
-        if line.values.get("line_discount") is None and product_code:
-            line.values["line_discount"] = _find_discount_for_item(raw_content, str(product_code))
 
 
 # ---------------------------------------------------------------------------
@@ -446,28 +536,6 @@ def _enrich_lines_from_devolucion(lines: list[DocumentLine], raw_content: str) -
             line.values["product_code"] = isbn
             if not line.values.get("quantity"):
                 line.values["quantity"] = recibida
-
-
-def _parse_document_subtype(content: str) -> str | None:
-    content_lower = content.lower()
-    if "nota de cr\u00e9dito" in content_lower or "nota de credito" in content_lower:
-        return "Nota de Crédito"
-    if "nota de d\u00e9bito" in content_lower or "nota de debito" in content_lower:
-        return "Nota de Débito"
-    if (
-        "nota de devoluci\u00f3n" in content_lower
-        or "nota de devolucion" in content_lower
-        or "diferencias en las devoluciones" in content_lower
-        or "diferencias en devoluciones" in content_lower
-        or "devolucion de consignacion" in content_lower
-        or "devoluci\u00f3n de consignaci\u00f3n" in content_lower
-        or "remito de devolucion" in content_lower
-        or "remito de devoluci\u00f3n" in content_lower
-    ):
-        return "Acuse de Devolución"
-    if re.search(r'(?<!no v[a\u00e1]lido como )\bfactura\b', content_lower):
-        return "Factura"
-    return None
 
 
 _COPY_MARKERS = re.compile(r'\b(DUPLICADO|TRIPLICADO|CUADRUPLICADO)\b', re.IGNORECASE)
@@ -569,8 +637,9 @@ class AzureDocumentIntelligenceExtractor:
             "raw_total_content": _content(fields.get("InvoiceTotal")),
         }
 
-        # Flujo principal: Azure extrae Items con Discount incluido.
-        # Fallback: si cobertura de ISBNs es baja, parsear desde raw_content.
+        # Flujo: Azure extrae Items → si cobertura < 90% se descarta y
+        # se usa el parser híbrido completo → siempre se aplica el
+        # enrichment genérico línea por línea para campos faltantes.
         lines = _extract_lines(fields.get("Items"))
 
         if _should_use_raw_parser(raw_content, lines):
@@ -578,8 +647,6 @@ class AzureDocumentIntelligenceExtractor:
             if parsed_lines:
                 lines = parsed_lines
 
-        # Colchón siempre activo: completa ISBN y descuento que Azure
-        # no puso en los campos correctos.
         _enrich_lines_with_discounts(lines, raw_content)
         _enrich_lines_from_devolucion(lines, raw_content)
 
