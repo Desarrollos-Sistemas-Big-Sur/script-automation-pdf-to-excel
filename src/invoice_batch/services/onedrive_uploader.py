@@ -90,7 +90,6 @@ class OneDriveClient:
             if resp.status_code == 200:
                 parent_id = resp.json()["id"]
             elif resp.status_code == 404:
-                # Crear la carpeta
                 create_resp = requests.post(
                     f"{_GRAPH_BASE}/users/{self.od.user_email}/drive/items/{parent_id}/children",
                     headers={**self._headers(), "Content-Type": "application/json"},
@@ -111,6 +110,7 @@ class OneDriveClient:
             f"{base}/{self.od.pending_folder}",
             f"{base}/{self.od.processed_folder}",
             f"{base}/{self.od.error_folder}",
+            f"{base}/{self.od.review_folder}",
         ] + [f"{base}/{sub}" for sub in _SUBTYPE_TO_FOLDER.values()]
 
         for folder in folders:
@@ -164,13 +164,26 @@ class OneDriveClient:
         )
         resp.raise_for_status()
 
-    def archive_pdf(self, item_id: str, filename: str, success: bool) -> None:
-        """Mueve el PDF de Pendientes a Procesados o Errores según resultado."""
-        dest = (
-            f"{self.od.folder_path}/{self.od.processed_folder}"
-            if success
-            else f"{self.od.folder_path}/{self.od.error_folder}"
-        )
+    def archive_pdf(
+        self,
+        item_id: str,
+        filename: str,
+        success: bool,
+        needs_review: bool = False,
+    ) -> None:
+        """Mueve el PDF de Pendientes a la carpeta correspondiente.
+
+        - Error al procesar              → Errores
+        - Procesado con warnings de total → Revisar
+        - Procesado correctamente         → Procesados
+        """
+        if not success:
+            dest = f"{self.od.folder_path}/{self.od.error_folder}"
+        elif needs_review:
+            dest = f"{self.od.folder_path}/{self.od.review_folder}"
+        else:
+            dest = f"{self.od.folder_path}/{self.od.processed_folder}"
+
         self._move_item(item_id, dest)
         self.logger.info("PDF archivado en OneDrive: %s → %s", filename, dest)
 
@@ -178,12 +191,24 @@ class OneDriveClient:
     # Subir Excel
     # ------------------------------------------------------------------
 
-    def upload_excel(self, local_path: Path, document_subtype: str | None) -> str:
-        """Sube un Excel al subfolder correspondiente según el tipo documental."""
-        sub = subfolder_for_subtype(document_subtype)
-        remote_folder = (
-            f"{self.od.folder_path}/{sub}" if sub else self.od.folder_path
-        )
+    def upload_excel(
+        self,
+        local_path: Path,
+        document_subtype: str | None,
+        needs_review: bool = False,
+    ) -> str:
+        """Sube un Excel al subfolder correspondiente según el tipo documental.
+
+        Si needs_review=True, sube a la carpeta Revisar en lugar del subfolder normal.
+        """
+        if needs_review:
+            remote_folder = f"{self.od.folder_path}/{self.od.review_folder}"
+        else:
+            sub = subfolder_for_subtype(document_subtype)
+            remote_folder = (
+                f"{self.od.folder_path}/{sub}" if sub else self.od.folder_path
+            )
+
         remote_path = f"{remote_folder}/{local_path.name}"
 
         resp = requests.put(
